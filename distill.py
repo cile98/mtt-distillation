@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.utils
 from tqdm import tqdm
-from utils import get_dataset, get_network, get_eval_pool, evaluate_synset, get_time, DiffAugment, ParamDiffAug
+from utils import get_dataset, get_network, get_eval_pool, evaluate_synset, get_time, DiffAugment, ParamDiffAug, get_racing_dataset, evaluate_racing
 import wandb
 import copy
 import random
@@ -32,7 +32,12 @@ def main(args):
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     eval_it_pool = np.arange(0, args.Iteration + 1, args.eval_it).tolist()
-    channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv = get_dataset(args.dataset, args.data_path, args.batch_real, args.subset, args=args)
+    if args.dataset != 'CarRacing':
+        channel, im_size, num_classes, class_names, mean, std, dst_train, dst_test, testloader, loader_train_dict, class_map, class_map_inv = get_dataset(
+            args.dataset, args.data_path, args.batch_real, args.subset, args=args)
+    else:
+        channel, im_size, num_classes, class_names, dst_train, loader_train_dict, class_map, class_map_inv = get_racing_dataset(
+            args.data_path, args=args)
     model_eval_pool = get_eval_pool(args.eval_mode, args.model, args.model)
 
     im_res = im_size[0]
@@ -46,7 +51,7 @@ def main(args):
     data_save = []
 
     if args.dsa:
-        # args.epoch_eval_train = 1000
+        args.epoch_eval_train = 1000
         args.dc_aug_param = None
 
     args.dsa_param = ParamDiffAug()
@@ -108,14 +113,38 @@ def main(args):
 
 
     ''' initialize the synthetic data '''
-    label_syn = torch.tensor([np.ones(args.ipc)*i for i in range(num_classes)], dtype=torch.long, requires_grad=False, device=args.device).view(-1) # [0,0,0, 1,1,1, ..., 9,9,9]
-
+    sl = []
+    if args.label_init == 'noise':
+        for i in range(args.ipc * num_classes):
+            tmp = np.random.rand(num_classes)
+            sl.append(tmp)
+        sl = np.array(sl)
+    elif args.label_init == 'one_hot':
+        tmp = []
+        for i in range(num_classes):
+            for n in range(args.ipc):
+                tmp.append(i)
+        tmp = np.array(tmp)
+        sl = np.zeros((num_classes * args.ipc, num_classes))
+        sl[np.arange(num_classes * args.ipc), tmp] = 1
+    elif args.label_init == 'uniform':
+        for i in range(args.ipc * num_classes):
+            tmp = np.ones(num_classes)/num_classes
+            sl.append(tmp)
+        sl = np.array(sl)
+    else:
+        for i in range(num_classes):
+            for n in range(args.ipc):
+                sl.append(i)
+        sl = np.array(sl)
+    soft_label_syn = torch.tensor(sl, dtype=torch.long, requires_grad=False, device=args.device) # float + grad for softlabels
     if args.texture:
         image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0]*args.canvas_size, im_size[1]*args.canvas_size), dtype=torch.float)
     else:
         image_syn = torch.randn(size=(num_classes * args.ipc, channel, im_size[0], im_size[1]), dtype=torch.float)
 
-    syn_lr = torch.tensor(args.lr_teacher).to(args.device)
+    syn_lr = torch.tensor(0.001).to(args.device)
+    #syn_lr = torch.tensor(args.lr_teacher).to(args.device)
 
     if args.pix_init == 'real':
         print('initialize synthetic data from random real images')
@@ -134,12 +163,14 @@ def main(args):
 
     ''' training '''
     image_syn = image_syn.detach().to(args.device).requires_grad_(True)
-    syn_lr = syn_lr.detach().to(args.device).requires_grad_(True)
+    syn_lr = syn_lr.detach().to(args.device).requires_grad_(False) # True
+    soft_label_syn = soft_label_syn.detach().to(args.device).requires_grad_(False) # True
     optimizer_img = torch.optim.SGD([image_syn], lr=args.lr_img, momentum=0.5)
-    optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5)
+    #optimizer_soft_label = torch.optim.SGD([soft_label_syn], lr=args.lr_label, momentum=0.5) # for most successful was 10 and 100
+    optimizer_lr = torch.optim.SGD([syn_lr], lr=args.lr_lr, momentum=0.5) #goes really negative and break
     optimizer_img.zero_grad()
-
-    criterion = nn.CrossEntropyLoss().to(args.device)
+    #optimizer_soft_label.zero_grad()
+    criterion = nn.CrossEntropyLoss().to(args.device) # MSELoss() for softlabels
     print('%s training begins'%get_time())
 
     expert_dir = os.path.join(args.buffer_path, args.dataset)
@@ -195,22 +226,26 @@ def main(args):
                     print('DSA augmentation strategy: \n', args.dsa_strategy)
                     print('DSA augmentation parameters: \n', args.dsa_param.__dict__)
                 else:
-                    print('DC augmentation parameters: \n', args.dc_aug_param)
+                    print('DC augmentation parameters: \n')
 
                 accs_test = []
                 accs_train = []
                 for it_eval in range(args.num_eval):
                     net_eval = get_network(model_eval, channel, num_classes, im_size).to(args.device) # get a random model
 
-                    eval_labs = label_syn
+                    eval_labs = soft_label_syn #torch.argmax(soft_label_syn, axis=1)
                     with torch.no_grad():
                         image_save = image_syn
                     image_syn_eval, label_syn_eval = copy.deepcopy(image_save.detach()), copy.deepcopy(eval_labs.detach()) # avoid any unaware modification
-
                     args.lr_net = syn_lr.item()
-                    _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture)
-                    accs_test.append(acc_test)
-                    accs_train.append(acc_train)
+                    if args.dataset != 'CarRacing':
+                        _, acc_train, acc_test = evaluate_synset(it_eval, net_eval, image_syn_eval, label_syn_eval, testloader, args, texture=args.texture)
+                        accs_test.append(acc_test)
+                        accs_train.append(acc_train)
+                    else:
+                        #evaluate_racing(net_eval)
+                        ...
+
                 accs_test = np.array(accs_test)
                 accs_train = np.array(accs_train)
                 acc_test_mean = np.mean(accs_test)
@@ -236,11 +271,11 @@ def main(args):
                     os.makedirs(save_dir)
 
                 torch.save(image_save.cpu(), os.path.join(save_dir, "images_{}.pt".format(it)))
-                torch.save(label_syn.cpu(), os.path.join(save_dir, "labels_{}.pt".format(it)))
+                torch.save(soft_label_syn.cpu(), os.path.join(save_dir, "labels_{}.pt".format(it)))
 
                 if save_this_it:
                     torch.save(image_save.cpu(), os.path.join(save_dir, "images_best.pt".format(it)))
-                    torch.save(label_syn.cpu(), os.path.join(save_dir, "labels_best.pt".format(it)))
+                    torch.save(soft_label_syn.cpu(), os.path.join(save_dir, "labels_best.pt".format(it)))
 
                 wandb.log({"Pixels": wandb.Histogram(torch.nan_to_num(image_syn.detach().cpu()))}, step=it)
 
@@ -333,7 +368,7 @@ def main(args):
 
         syn_images = image_syn
 
-        y_hat = label_syn.to(args.device)
+        y_hat = soft_label_syn.to(args.device)
 
         param_loss_list = []
         param_dist_list = []
@@ -344,7 +379,6 @@ def main(args):
             if not indices_chunks:
                 indices = torch.randperm(len(syn_images))
                 indices_chunks = list(torch.split(indices, args.batch_syn))
-
             these_indices = indices_chunks.pop()
 
 
@@ -389,12 +423,18 @@ def main(args):
 
         optimizer_img.zero_grad()
         optimizer_lr.zero_grad()
+        #optimizer_soft_label.zero_grad()
 
         grand_loss.backward()
-
+        torch.nn.utils.clip_grad_norm_(syn_images, 5)
+        torch.nn.utils.clip_grad_norm_(syn_lr, 1)
+        torch.nn.utils.clip_grad_norm_(soft_label_syn, 1)
         optimizer_img.step()
         optimizer_lr.step()
+        #optimizer_soft_label.step()
 
+        #syn_lr = torch.nn.functional.softplus(syn_lr)
+        # clip labels by 10 and 0 + int on evaluation + separate lr for labels
         wandb.log({"Grand_Loss": grand_loss.detach().cpu(),
                    "Start_Epoch": start_epoch})
 
@@ -410,13 +450,13 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Parameter Processing')
 
-    parser.add_argument('--dataset', type=str, default='CIFAR10', help='dataset')
+    parser.add_argument('--dataset', type=str, default='CarRacing', help='dataset')
 
     parser.add_argument('--subset', type=str, default='imagenette', help='ImageNet subset. This only does anything when --dataset=ImageNet')
 
-    parser.add_argument('--model', type=str, default='ConvNet', help='model')
+    parser.add_argument('--model', type=str, default='CarRacing', help='model')
 
-    parser.add_argument('--ipc', type=int, default=1, help='image(s) per class')
+    parser.add_argument('--ipc', type=int, default=20, help='image(s) per class')
 
     parser.add_argument('--eval_mode', type=str, default='S',
                         help='eval_mode, check utils.py for more info')
@@ -426,39 +466,43 @@ if __name__ == '__main__':
     parser.add_argument('--eval_it', type=int, default=100, help='how often to evaluate')
 
     parser.add_argument('--epoch_eval_train', type=int, default=1000, help='epochs to train a model with synthetic data')
-    parser.add_argument('--Iteration', type=int, default=5000, help='how many distillation steps to perform')
+    parser.add_argument('--Iteration', type=int, default=15000, help='how many distillation steps to perform')
 
     parser.add_argument('--lr_img', type=float, default=1000, help='learning rate for updating synthetic images')
     parser.add_argument('--lr_lr', type=float, default=1e-05, help='learning rate for updating... learning rate')
     parser.add_argument('--lr_teacher', type=float, default=0.01, help='initialization for synthetic learning rate')
+    parser.add_argument('--lr_label', type=float, default=10, help='initialization for synthetic labels learning rate')
 
     parser.add_argument('--lr_init', type=float, default=0.01, help='how to init lr (alpha)')
 
-    parser.add_argument('--batch_real', type=int, default=256, help='batch size for real data')
+    parser.add_argument('--batch_real', type=int, default=512, help='batch size for real data')
     parser.add_argument('--batch_syn', type=int, default=None, help='should only use this if you run out of VRAM')
-    parser.add_argument('--batch_train', type=int, default=256, help='batch size for training networks')
+    parser.add_argument('--batch_train', type=int, default=512, help='batch size for training networks')
 
     parser.add_argument('--pix_init', type=str, default='real', choices=["noise", "real"],
                         help='noise/real: initialize synthetic images from random noise or randomly sampled real images.')
 
-    parser.add_argument('--dsa', type=str, default='True', choices=['True', 'False'],
+    parser.add_argument('--label_init', type=str, default='real', choices=["noise", "one_hot", 'uniform', 'real'],
+                        help='noise/one_hot/uniform: initialize synthetic labels from random noise, as one_hot from true labels or as uniform 1/C.')
+
+    parser.add_argument('--dsa', type=str, default='False', choices=['True', 'False'],
                         help='whether to use differentiable Siamese augmentation.')
 
     parser.add_argument('--dsa_strategy', type=str, default='color_crop_cutout_flip_scale_rotate',
                         help='differentiable Siamese augmentation strategy')
 
     parser.add_argument('--data_path', type=str, default='data', help='dataset path')
-    parser.add_argument('--buffer_path', type=str, default='./buffers', help='buffer path')
+    parser.add_argument('--buffer_path', type=str, default='buffers', help='buffer path')
 
     parser.add_argument('--expert_epochs', type=int, default=3, help='how many expert epochs the target params are')
     parser.add_argument('--syn_steps', type=int, default=20, help='how many steps to take on synthetic data')
-    parser.add_argument('--max_start_epoch', type=int, default=25, help='max epoch we can start at')
+    parser.add_argument('--max_start_epoch', type=int, default=150, help='max epoch we can start at')
 
-    parser.add_argument('--zca', action='store_true', help="do ZCA whitening")
+    parser.add_argument('--zca', action='store_true', default=False, help="do ZCA whitening")
 
     parser.add_argument('--load_all', action='store_true', help="only use if you can fit all expert trajectories into RAM")
 
-    parser.add_argument('--no_aug', type=bool, default=False, help='this turns off diff aug during distillation')
+    parser.add_argument('--no_aug', type=bool, default=True, help='this turns off diff aug during distillation')
 
     parser.add_argument('--texture', action='store_true', help="will distill textures instead")
     parser.add_argument('--canvas_size', type=int, default=2, help='size of synthetic canvas')
@@ -471,7 +515,7 @@ if __name__ == '__main__':
     parser.add_argument('--force_save', action='store_true', help='this will save images for 50ipc')
 
     args = parser.parse_args()
-
+    # args.batch_syn = 10 why???
     main(args)
 
 

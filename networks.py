@@ -24,6 +24,145 @@ class MLP(nn.Module):
         return out
 
 
+class CarRacing(nn.Module):
+    def __init__(self, mode="train", num_frames=50):
+        """
+        1.1 d)
+        Implementation of the network layers. The image size of the input
+        observations is 96x96 pixels.
+        """
+        super().__init__()
+
+        # setting device on GPU if available, else CPU
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.num_action_classes = 6
+        self.mode = mode
+        self.num_frames = num_frames
+
+        self.counter = 0
+
+        self.conv1 = torch.nn.Conv2d(3, 8, kernel_size=4, stride=2)
+        self.relu1 = torch.nn.ReLU()
+
+        self.conv2 = torch.nn.Conv2d(8, 16, kernel_size=3, stride=2)
+        self.relu2 = torch.nn.ReLU()
+
+        self.conv3 = torch.nn.Conv2d(16, 32, kernel_size=3, stride=2)
+        self.relu3 = torch.nn.ReLU()
+
+        # not used for 32
+        #self.conv4 = torch.nn.Conv2d(32, 64, kernel_size=3, stride=2)
+        #self.relu4 = torch.nn.ReLU()
+
+        # not used for 64
+        #self.conv5 = torch.nn.Conv2d(64, 128, kernel_size=3, stride=1)
+        #self.relu5 = torch.nn.ReLU()
+
+        # not used for 64
+        #self.conv6 = torch.nn.Conv2d(128, 256, kernel_size=3, stride=1)
+        #self.relu6 = torch.nn.ReLU()
+
+        # 576 input for 64; 288 for 32
+        self.fc1 = torch.nn.Sequential(torch.nn.Linear(288, 128), torch.nn.ReLU(),
+                                       torch.nn.Linear(128, 64), torch.nn.ReLU())
+        self.fc2 = torch.nn.Sequential(torch.nn.Linear(64, self.num_action_classes))
+
+    def apply_net(self, observation):
+        x = self.conv1(observation)
+        x = self.relu1(x)
+
+        x = self.conv2(x)
+        x = self.relu2(x)
+
+        x = self.conv3(x)
+        x = self.relu3(x)
+
+        #x = self.conv4(x)
+        #x = self.relu4(x)
+
+        #x = self.conv5(x)
+        #x = self.relu5(x)
+
+        #x = self.conv6(x)
+        #x = self.relu6(x)
+
+        x = torch.flatten(x, start_dim=1)
+        x = self.fc1(x)
+        x = self.fc2(x)
+        return x
+
+    def forward(self, observation):
+        """
+        1.1 e)
+        The forward pass of the network. Returns the prediction for the given
+        input observation.
+        observation:   torch.Tensor of size (batch_size, 96, 96, 3)
+        return         torch.Tensor of size (batch_size, C)
+        """
+        return self.apply_net(observation)
+    def actions_to_classes(self, actions):
+        """
+        1.1 c)
+        For a given set of actions map every action to its corresponding
+        action-class representation. Every action is represented by a 1-dim vector
+        with the entry corresponding to the class number.
+        actions:        python list of N torch.Tensors of size 3
+        return          python list of N torch.Tensors of size 1
+        """
+
+        action_class_mapping = {
+            "nothing": torch.Tensor([0.0, 0.0, 0.0]),
+            "gas": torch.Tensor([0.0, 1.0, 0.0]),
+            "steer_right": torch.Tensor([1.0, 0.0, 0.0]),
+            "steer_left": torch.Tensor([-1.0, 0.0, 0.0]),
+            "steer_left and brake": torch.Tensor([-1.0, 0.0, 0.4]),
+            "steer_right and brake": torch.Tensor([1.0, 0.0, 0.4]),
+        }
+
+        action_class = []
+
+        counter = 0
+
+        for elem in actions:
+
+            if torch.equal(elem, action_class_mapping["nothing"]):
+                action_class.append(torch.LongTensor([0]))
+                counter += 1
+            elif torch.equal(elem, action_class_mapping["gas"]):
+                action_class.append(torch.LongTensor([1]))
+            elif torch.equal(elem, action_class_mapping["steer_right"]):
+                action_class.append(torch.LongTensor([2]))
+            elif torch.equal(elem, action_class_mapping["steer_left"]):
+                action_class.append(torch.LongTensor([3]))
+            elif torch.equal(elem, action_class_mapping["steer_left and brake"]):
+                action_class.append(torch.LongTensor([4]))
+            elif torch.equal(elem, action_class_mapping["steer_right and brake"]):
+                action_class.append(torch.LongTensor([5]))
+
+        #print(counter)
+        return action_class
+        # pass
+
+    def scores_to_action(self, scores):
+        """
+        1.1 c)
+        Maps the scores predicted by the network to an action-class and returns
+        the corresponding action [steer, gas, brake].
+                        C = number of classes
+        scores:         python list of torch.Tensors of size C
+        return          (float, float, float)
+        """
+        class_to_action_mapping = {
+            0: [0.0, 0.0, 0.0],  # nothing
+            1: [0.0, 1.0, 0.0],  # gas
+            2: [1.0, 0.0, 0.0],  # steer right
+            3: [-1.0, 0.0, 0.0],  # steer left
+            4: [-1.0, 0.0, 0.4],  # steer left and brake
+            5: [1.0, 0.0, 0.4]  # steer right and brake
+        }
+
+        return class_to_action_mapping[torch.topk(scores, 1)[1].item()]
+
 
 ''' ConvNet '''
 class ConvNet(nn.Module):
